@@ -1,0 +1,955 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
+      - name: Criar projeto e compilar
+        run: |
+          mkdir -p poco/app/src/main/java/com/poco/secrets
+          cd poco
+          cat > settings.gradle.kts <<'FIM0'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "PocoSecrets"
+          include(":app")
+          FIM0
+          cat > build.gradle.kts <<'FIM1'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          FIM1
+          cat > gradle.properties <<'FIM2'
+          org.gradle.jvmargs=-Xmx2g
+          android.useAndroidX=true
+          android.nonTransitiveRClass=true
+          FIM2
+          cat > app/build.gradle.kts <<'FIM3'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.poco.secrets"
+              compileSdk = 35
+              defaultConfig {
+                  applicationId = "com.poco.secrets"
+                  minSdk = 30
+                  targetSdk = 35
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              buildTypes {
+                  release { isMinifyEnabled = false }
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+
+          dependencies {
+              implementation("dev.rikka.shizuku:api:13.1.5")
+              implementation("dev.rikka.shizuku:provider:13.1.5")
+          }
+          FIM3
+          cat > app/src/main/AndroidManifest.xml <<'FIM4'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
+              <application
+                  android:allowBackup="false"
+                  android:label="Poco Secret Settings"
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+
+                  <provider
+                      android:name="rikka.shizuku.ShizukuProvider"
+                      android:authorities="${applicationId}.shizuku"
+                      android:enabled="true"
+                      android:exported="true"
+                      android:multiprocess="false"
+                      android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          FIM4
+          cat > app/src/main/java/com/poco/secrets/Shell.kt <<'FIM5'
+          package com.poco.secrets
+
+          import rikka.shizuku.Shizuku
+
+          /** Executa comandos de shell com a permissão do Shizuku (UID shell/ADB). */
+          object Shell {
+              private val newProcess by lazy {
+                  Shizuku::class.java.getDeclaredMethod(
+                      "newProcess",
+                      Array<String>::class.java,
+                      Array<String>::class.java,
+                      String::class.java
+                  ).apply { isAccessible = true }
+              }
+
+              fun run(cmd: String): String {
+                  val p = newProcess.invoke(null, arrayOf("sh", "-c", cmd), null, null) as Process
+                  val out = p.inputStream.bufferedReader().readText()
+                  val err = p.errorStream.bufferedReader().readText()
+                  p.waitFor()
+                  return (out + err).trim()
+              }
+          }
+          FIM5
+          cat > app/src/main/java/com/poco/secrets/Secrets.kt <<'FIM6'
+          package com.poco.secrets
+
+          import android.content.Context
+          import org.json.JSONObject
+
+          class Secrets(ctx: Context, private val log: (String) -> Unit) {
+
+              private val prefs = ctx.getSharedPreferences("backup", Context.MODE_PRIVATE)
+
+              data class Step(val ns: String, val key: String, val on: String, val off: String)
+              data class Hidden(val label: String, val steps: List<Step>)
+              data class Launch(val label: String, val args: String)
+
+              val hidden = listOf(
+                  Hidden("Tela sempre ligada enquanto carrega", listOf(Step("global", "stay_on_while_plugged_in", "7", "0"))),
+                  Hidden("Forçar multi-janela em todos os apps (reiniciar)", listOf(Step("global", "force_resizable_activities", "1", "0"))),
+                  Hidden("Janelas flutuantes / freeform (reiniciar)", listOf(Step("global", "enable_freeform_support", "1", "0"))),
+                  Hidden("Mostrar toques na tela", listOf(Step("system", "show_touches", "1", "0"))),
+                  Hidden("Mostrar coordenadas do toque", listOf(Step("system", "pointer_location", "1", "0"))),
+                  Hidden("Limites de layout (debug visual)", listOf(Step("prop", "debug.layout", "true", "false"))),
+                  Hidden("Sobreposição de GPU / overdraw (reabra os apps)", listOf(Step("prop", "debug.hwui.overdraw", "show", "false"))),
+                  Hidden("Perfil de renderização em barras (reabra os apps)", listOf(Step("prop", "debug.hwui.profile", "visual_bars", "false"))),
+                  Hidden("Renderizador Vulkan (experimental, reabra os apps)", listOf(Step("prop", "debug.hwui.renderer", "skiavk", ""))),
+                  Hidden("Tela em escala de cinza (economiza bateria no AMOLED)", listOf(
+                      Step("secure", "accessibility_display_daltonizer", "0", "-1"),
+                      Step("secure", "accessibility_display_daltonizer_enabled", "1", "0")
+                  )),
+                  Hidden("Inverter cores", listOf(Step("secure", "accessibility_display_inversion_enabled", "1", "0"))),
+                  Hidden("Texto de alto contraste", listOf(Step("secure", "high_text_contrast_enabled", "1", "0"))),
+                  Hidden("Desligar notificações flutuantes (heads-up)", listOf(Step("global", "heads_up_notifications_enabled", "0", "1"))),
+                  Hidden("Finalizar atividades ao sair (só testes, piora o desempenho)", listOf(Step("global", "always_finish_activities", "1", "0"))),
+                  Hidden("Permitir apps no armazenamento externo", listOf(Step("global", "force_allow_on_external", "1", "0"))),
+                  Hidden("Rotação automática", listOf(Step("system", "accelerometer_rotation", "1", "0"))),
+                  Hidden("Desligar vibração ao tocar", listOf(Step("system", "haptic_feedback_enabled", "0", "1")))
+              )
+
+              val launches = listOf(
+                  Launch("Opções do desenvolvedor", "-a android.settings.APPLICATION_DEVELOPMENT_SETTINGS"),
+                  Launch("Menu de testes (info do telefone, uso)", "-n com.android.settings/.TestingSettings"),
+                  Launch("Info do rádio/rede (RadioInfo)", "-n com.android.phone/.settings.RadioInfo"),
+                  Launch("Todos os apps (inclui os do sistema)", "-a android.settings.MANAGE_ALL_APPLICATIONS_SETTINGS"),
+                  Launch("Otimização de bateria por app", "-a android.settings.IGNORE_BATTERY_OPTIMIZATION_SETTINGS"),
+                  Launch("Acesso a dados de uso", "-a android.settings.USAGE_ACCESS_SETTINGS"),
+                  Launch("Início automático de apps (Xiaomi)", "-n com.miui.securitycenter/com.miui.permcenter.autostart.AutoStartManagementActivity"),
+                  Launch("Implementação do WebView", "-a android.settings.WEBVIEW_SETTINGS"),
+                  Launch("Armazenamento interno", "-a android.settings.INTERNAL_STORAGE_SETTINGS"),
+                  Launch("Configurações de IP do Wi-Fi", "-a android.settings.WIFI_IP_SETTINGS"),
+                  Launch("Operadora e rede", "-a android.settings.NETWORK_OPERATOR_SETTINGS"),
+                  Launch("Serviços de acessibilidade", "-a android.settings.ACCESSIBILITY_SETTINGS"),
+                  Launch("Informações do dispositivo", "-a android.settings.DEVICE_INFO_SETTINGS")
+              )
+
+              val secretCodes = listOf("4636", "6484", "64663")
+
+              // ---------- base ----------
+              private fun sh(c: String) = Shell.run(c)
+
+              private fun q(s: String) = "'" + s.replace("'", "'\\''") + "'"
+
+              private fun obj(k: String) = JSONObject(prefs.getString(k, "{}")!!)
+
+              private fun saveOnce(k: String, key: String, orig: () -> String) {
+                  val o = obj(k)
+                  if (!o.has(key)) {
+                      o.put(key, orig())
+                      prefs.edit().putString(k, o.toString()).apply()
+                  }
+              }
+
+              // ---------- settings ----------
+              fun listSettings(ns: String): List<String> =
+                  sh("settings list $ns").lines().filter { it.contains("=") }.sorted()
+
+              fun setSetting(ns: String, key: String, value: String) {
+                  if (!Regex("[A-Za-z0-9_.:-]+").matches(key)) {
+                      log("Nome de chave inválido: $key")
+                      return
+                  }
+                  saveOnce("sbak", "$ns:$key") { sh("settings get $ns $key") }
+                  val o = sh("settings put $ns $key ${q(value)}")
+                  log("$ns/$key = ${sh("settings get $ns $key")} ${if (o.isBlank()) "" else "($o)"}")
+              }
+
+              fun delSetting(ns: String, key: String) {
+                  saveOnce("sbak", "$ns:$key") { sh("settings get $ns $key") }
+                  log("$ns/$key apagada. ${sh("settings delete $ns $key")}")
+              }
+
+              // ---------- device_config ----------
+              fun listDeviceConfig(): List<String> =
+                  sh("device_config list").lines().filter {
+                      val s = it.indexOf('/')
+                      val e = it.indexOf('=')
+                      s in 1 until e
+                  }.sorted()
+
+              fun splitDc(line: String): Triple<String, String, String> {
+                  val slash = line.indexOf('/')
+                  val eq = line.indexOf('=', slash + 1)
+                  return Triple(line.substring(0, slash), line.substring(slash + 1, eq), line.substring(eq + 1))
+              }
+
+              fun setDc(ns: String, flag: String, value: String) {
+                  saveOnce("dbak", "$ns $flag") { sh("device_config get $ns $flag") }
+                  val o = sh("device_config put $ns $flag ${q(value)}")
+                  log("$ns/$flag = ${sh("device_config get $ns $flag")} ${if (o.isBlank()) "" else "($o)"}")
+              }
+
+              fun delDc(ns: String, flag: String) {
+                  saveOnce("dbak", "$ns $flag") { sh("device_config get $ns $flag") }
+                  log("$ns/$flag apagada. ${sh("device_config delete $ns $flag")}")
+              }
+
+              fun dcSync(disable: Boolean) {
+                  val m = if (disable) "persistent" else "none"
+                  log("Sincronização de flags: $m ${sh("device_config set_sync_disabled_for_tests $m")}")
+                  if (disable) log("Os ajustes de device_config não serão mais sobrescritos pelo servidor. Religue depois.")
+              }
+
+              // ---------- propriedades ----------
+              fun listProps(): List<String> =
+                  sh("getprop").lines().filter { it.startsWith("[") }
+                      .map { it.replace("]: [", " = ").removePrefix("[").removeSuffix("]") }.sorted()
+
+              fun setProp(key: String, value: String) {
+                  if (!Regex("[A-Za-z0-9_.-]+").matches(key)) {
+                      log("Nome de propriedade inválido.")
+                      return
+                  }
+                  val o = sh("setprop $key ${q(value)}")
+                  saveOnce("props", key) { "reset" }
+                  log("$key = ${sh("getprop $key")} ${if (o.isBlank()) "" else "($o)"}")
+                  log("(sem root, só algumas propriedades aceitam alteração; voltam ao padrão ao reiniciar)")
+              }
+
+              // ---------- app ops e permissões ----------
+              fun listPackages(system: Boolean): List<String> {
+                  val flag = if (system) "-s" else "-3"
+                  return sh("pm list packages $flag").lines().map { it.removePrefix("package:").trim() }.filter { it.isNotEmpty() }
+              }
+
+              fun appOps(pkg: String): List<String> =
+                  sh("cmd appops get $pkg").lines()
+                      .map { it.trim().removePrefix("Uid mode:").trim() }
+                      .filter { it.contains(":") && !it.startsWith("No operations") }
+                      .map { it.substringBefore(";").trim() }
+                      .sorted()
+
+              fun setOp(pkg: String, op: String, mode: String) {
+                  if (!Regex("[A-Z0-9_]+").matches(op)) {
+                      log("Nome de operação inválido: $op")
+                      return
+                  }
+                  saveOnce("obak", "$pkg $op") {
+                      sh("cmd appops get $pkg $op").replace("Uid mode:", "")
+                          .substringAfter(":", "default").substringBefore(";").trim().ifBlank { "default" }
+                  }
+                  log("$pkg $op → $mode ${sh("cmd appops set $pkg $op $mode")}")
+              }
+
+              fun appPerms(pkg: String): List<String> {
+                  val re = Regex("""^\s+([A-Za-z0-9_.]+): granted=(true|false)""")
+                  return sh("dumpsys package $pkg").lines().mapNotNull { line ->
+                      re.find(line)?.let { m -> m.groupValues[1] + ": " + (if (m.groupValues[2] == "true") "CONCEDIDA" else "negada") }
+                  }.distinct()
+              }
+
+              fun setPerm(pkg: String, perm: String, grant: Boolean, wasGranted: Boolean) {
+                  saveOnce("pbak", "$pkg $perm") { wasGranted.toString() }
+                  val cmd = if (grant) "grant" else "revoke"
+                  val o = sh("pm $cmd $pkg $perm")
+                  log("$pkg $perm: $cmd ${if (o.isBlank()) "ok" else o}")
+              }
+
+              fun powerKeeper(pkg: String, label: String) {
+                  log(sh("am start -n com.miui.powerkeeper/com.miui.powerkeeper.ui.HiddenAppsConfigActivity --es package_name $pkg --es package_label ${q(label)}"))
+                  log("(se nada abrir, essa tela não existe nesta versão do HyperOS)")
+              }
+
+              // ---------- overlays ----------
+              fun listOverlays(): List<String> =
+                  sh("cmd overlay list").lines().map { it.trim() }
+                      .filter { it.startsWith("[x]") || it.startsWith("[ ]") }
+                      .map { (if (it.startsWith("[x]")) "ON   " else "OFF  ") + it.substring(3).trim() }
+
+              fun setOverlay(name: String, enable: Boolean) {
+                  saveOnce("ovl", name) { if (enable) "off" else "on" }
+                  val m = if (enable) "enable" else "disable"
+                  log("$name: $m ${sh("cmd overlay $m --user 0 $name")}")
+              }
+
+              // ---------- tela (wm) ----------
+              fun wmInfo() {
+                  log(sh("wm size"))
+                  log(sh("wm density"))
+              }
+
+              fun wmDensity(v: String) {
+                  if (!Regex("\\d{3}").matches(v)) {
+                      log("Use um número de 3 dígitos (ex.: 420).")
+                      return
+                  }
+                  saveOnce("wm", "reset") { "yes" }
+                  log(sh("wm density $v"))
+              }
+
+              fun wmSize(v: String) {
+                  if (!Regex("\\d{3,4}x\\d{3,4}").matches(v)) {
+                      log("Use o formato 1080x2400.")
+                      return
+                  }
+                  saveOnce("wm", "reset") { "yes" }
+                  log(sh("wm size $v"))
+              }
+
+              fun wmReset() {
+                  sh("wm size reset")
+                  sh("wm density reset")
+                  log("Resolução e DPI voltaram ao padrão.")
+              }
+
+              // ---------- opções ocultas populares ----------
+              fun applyHidden(h: Hidden, on: Boolean) {
+                  h.steps.forEach { s ->
+                      val v = if (on) s.on else s.off
+                      if (s.ns == "prop") {
+                          sh("setprop ${s.key} ${q(v)}")
+                          saveOnce("props", s.key) { "reset" }
+                          log("setprop ${s.key} = ${sh("getprop ${s.key}")} (volta ao padrão ao reiniciar)")
+                      } else {
+                          setSetting(s.ns, s.key, v)
+                      }
+                  }
+                  val estado = if (on) "ligado" else "desligado"
+                  log("✔ ${h.label}: $estado")
+              }
+
+              // ---------- atividades e códigos ----------
+              fun launch(l: Launch) {
+                  val o = sh("am start ${l.args}")
+                  log("${l.label}: ${if (o.isBlank()) "ok" else o}")
+                  log("(pode não existir nesta versão do HyperOS)")
+              }
+
+              fun secretCode(code: String) {
+                  log("Código *#*#$code#*#*: " + sh("am broadcast -a android.provider.Telephony.SECRET_CODE -d android_secret_code://$code"))
+                  log("(se nada abrir, este código não é suportado neste aparelho)")
+              }
+
+              // ---------- terminal ----------
+              fun terminal(cmd: String) {
+                  log("$ $cmd")
+                  val o = sh("timeout 25 sh -c ${q(cmd)}")
+                  if (o.isBlank()) log("(sem saída)")
+                  else if (o.length > 6000) log(o.take(6000) + "\n... (cortado; use 'Salvar dump' para ver tudo)")
+                  else log(o)
+              }
+
+              fun dumpAll() {
+                  val f = "/sdcard/Download/poco_dump.txt"
+                  sh("( echo '== SETTINGS system'; settings list system; echo '== SETTINGS secure'; settings list secure; echo '== SETTINGS global'; settings list global; echo '== DEVICE_CONFIG'; device_config list; echo '== GETPROP'; getprop ) > $f 2>&1")
+                  log("Salvo em Download/poco_dump.txt (${sh("wc -c < $f")} bytes). Abra com qualquer leitor de texto.")
+              }
+
+              // ---------- alterações e restauração ----------
+              fun showChanges() {
+                  listOf(
+                      "sbak" to "Settings", "dbak" to "Device config", "obak" to "App Ops",
+                      "pbak" to "Permissões", "ovl" to "Overlays", "props" to "Propriedades"
+                  ).forEach { (k, n) ->
+                      val o = obj(k)
+                      log("$n alterados: ${o.length()}")
+                      o.keys().forEach { key -> log("   $key (original: ${o.getString(key)})") }
+                  }
+              }
+
+              fun restoreAll() {
+                  val s = obj("sbak")
+                  s.keys().forEach { k ->
+                      val v = s.getString(k)
+                      val i = k.indexOf(':')
+                      val ns = k.substring(0, i)
+                      val key = k.substring(i + 1)
+                      if (v == "null" || v.isEmpty()) sh("settings delete $ns $key")
+                      else sh("settings put $ns $key ${q(v)}")
+                  }
+                  val d = obj("dbak")
+                  d.keys().forEach { k ->
+                      val v = d.getString(k)
+                      val i = k.indexOf(' ')
+                      val ns = k.substring(0, i)
+                      val flag = k.substring(i + 1)
+                      if (v == "null" || v.isEmpty()) sh("device_config delete $ns $flag")
+                      else sh("device_config put $ns $flag ${q(v)}")
+                  }
+                  val o = obj("obak")
+                  o.keys().forEach { k ->
+                      val i = k.indexOf(' ')
+                      sh("cmd appops set ${k.substring(0, i)} ${k.substring(i + 1)} ${o.getString(k)}")
+                  }
+                  val p = obj("pbak")
+                  p.keys().forEach { k ->
+                      val i = k.indexOf(' ')
+                      val cmd = if (p.getString(k) == "true") "grant" else "revoke"
+                      sh("pm $cmd ${k.substring(0, i)} ${k.substring(i + 1)}")
+                  }
+                  val ov = obj("ovl")
+                  ov.keys().forEach { k ->
+                      val m = if (ov.getString(k) == "on") "enable" else "disable"
+                      sh("cmd overlay $m --user 0 $k")
+                  }
+                  obj("props").keys().forEach { k -> sh("setprop $k ''") }
+                  if (obj("wm").length() > 0) wmReset()
+                  sh("device_config set_sync_disabled_for_tests none")
+                  prefs.edit().clear().apply()
+                  log("Tudo desfeito: valores originais devolvidos.")
+              }
+          }
+          FIM6
+          cat > app/src/main/java/com/poco/secrets/MainActivity.kt <<'FIM7'
+          package com.poco.secrets
+
+          import android.app.Activity
+          import android.app.AlertDialog
+          import android.content.ClipData
+          import android.content.ClipboardManager
+          import android.content.Context
+          import android.content.pm.PackageManager
+          import android.graphics.Typeface
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.Looper
+          import android.text.Editable
+          import android.text.TextWatcher
+          import android.view.View
+          import android.view.ViewGroup
+          import android.view.WindowInsets
+          import android.widget.*
+          import rikka.shizuku.Shizuku
+          import java.util.concurrent.Executors
+
+          class MainActivity : Activity() {
+
+              private val exec = Executors.newSingleThreadExecutor()
+              private lateinit var root: LinearLayout
+              private var container: LinearLayout? = null
+              private lateinit var status: TextView
+              private lateinit var logView: TextView
+              private val buttons = mutableListOf<Button>()
+              private lateinit var sec: Secrets
+
+              private val permListener = Shizuku.OnRequestPermissionResultListener { _, _ -> refresh() }
+              private val binderListener = Shizuku.OnBinderReceivedListener { runOnUiThread { refresh() } }
+              private val deadListener = Shizuku.OnBinderDeadListener { runOnUiThread { refresh() } }
+
+              private val presets = listOf(
+                  "dumpsys battery",
+                  "dumpsys meminfo | head -40",
+                  "dumpsys cpuinfo | head -25",
+                  "dumpsys thermalservice | head -40",
+                  "dumpsys display | head -60",
+                  "dumpsys deviceidle | head -40",
+                  "dumpsys activity processes | head -60",
+                  "pm list features",
+                  "pm list packages -f -3",
+                  "cmd package list libraries",
+                  "getprop | grep -i thermal",
+                  "getprop | grep -i miui",
+                  "top -n 1 -b | head -25",
+                  "cat /proc/cpuinfo | head -30",
+                  "cat /proc/meminfo | head -20",
+                  "df -h",
+                  "logcat -d -t 100",
+                  "wm size; wm density",
+                  "settings list global | head -60"
+              )
+
+              private fun ready() =
+                  Shizuku.pingBinder() && Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
+
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+              private fun toast(m: String) = Toast.makeText(this, m, Toast.LENGTH_LONG).show()
+              private fun say(m: String) = runOnUiThread { logView.append(m + "\n") }
+
+              // ---------- construção da tela ----------
+              private fun section(title: String, expanded: Boolean = false) {
+                  val content = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      visibility = if (expanded) View.VISIBLE else View.GONE
+                  }
+                  val head = Button(this).apply {
+                      text = (if (expanded) "▼  " else "▶  ") + title
+                      setAllCaps(false)
+                      textSize = 15f
+                      setTypeface(null, Typeface.BOLD)
+                      setOnClickListener {
+                          val open = content.visibility == View.GONE
+                          content.visibility = if (open) View.VISIBLE else View.GONE
+                          text = (if (open) "▼  " else "▶  ") + title
+                      }
+                  }
+                  root.addView(head)
+                  root.addView(content)
+                  container = content
+              }
+
+              private fun add(label: String, action: () -> Unit) = addUi(label) { runTask(action) }
+
+              private fun addUi(label: String, action: () -> Unit) {
+                  val b = Button(this).apply {
+                      text = label
+                      setAllCaps(false)
+                      setOnClickListener { action() }
+                  }
+                  buttons.add(b)
+                  (container ?: root).addView(b)
+              }
+
+              private fun label(p: String): String = try {
+                  packageManager.getApplicationLabel(packageManager.getApplicationInfo(p, 0)).toString()
+              } catch (e: Exception) {
+                  p
+              }
+
+              // ---------- diálogos ----------
+              private fun pickOne(title: String, items: List<String>, onPick: (Int) -> Unit) {
+                  AlertDialog.Builder(this)
+                      .setTitle(title)
+                      .setItems(items.toTypedArray()) { _, i -> onPick(i) }
+                      .setNegativeButton("Cancelar", null)
+                      .show()
+              }
+
+              private fun browse(title: String, all: List<String>, onPick: (String) -> Unit) {
+                  val shown = ArrayList<String>(all)
+                  val adapter = ArrayAdapter<String>(this, android.R.layout.simple_list_item_1, shown)
+                  val list = ListView(this)
+                  list.adapter = adapter
+                  val search = EditText(this)
+                  search.hint = "Filtrar..."
+                  search.setSingleLine(true)
+                  search.addTextChangedListener(object : TextWatcher {
+                      override fun afterTextChanged(s: Editable?) {
+                          val f = s.toString().lowercase()
+                          shown.clear()
+                          shown.addAll(all.filter { it.lowercase().contains(f) })
+                          adapter.notifyDataSetChanged()
+                      }
+
+                      override fun beforeTextChanged(s: CharSequence?, st: Int, c: Int, a: Int) {}
+                      override fun onTextChanged(s: CharSequence?, st: Int, b: Int, c: Int) {}
+                  })
+                  val box = LinearLayout(this)
+                  box.orientation = LinearLayout.VERTICAL
+                  box.addView(search)
+                  box.addView(list, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(420)))
+                  list.setOnItemClickListener { _, _, pos, _ -> if (pos < shown.size) onPick(shown[pos]) }
+                  AlertDialog.Builder(this)
+                      .setTitle(title)
+                      .setView(box)
+                      .setNegativeButton("Fechar", null)
+                      .show()
+              }
+
+              private fun input(title: String, hint: String, initial: String, onOk: (String) -> Unit) {
+                  val e = EditText(this)
+                  e.hint = hint
+                  e.setText(initial)
+                  AlertDialog.Builder(this)
+                      .setTitle(title)
+                      .setView(e)
+                      .setPositiveButton("OK") { _, _ -> onOk(e.text.toString()) }
+                      .setNegativeButton("Cancelar", null)
+                      .show()
+              }
+
+              private fun editValue(title: String, current: String, onSave: (String) -> Unit, onDelete: (() -> Unit)?) {
+                  val e = EditText(this)
+                  e.setText(current)
+                  val b = AlertDialog.Builder(this)
+                      .setTitle(title)
+                      .setView(e)
+                      .setPositiveButton("Salvar") { _, _ -> onSave(e.text.toString()) }
+                      .setNegativeButton("Cancelar", null)
+                  if (onDelete != null) b.setNeutralButton("Apagar") { _, _ -> onDelete() }
+                  b.show()
+              }
+
+              /** Aplica a mudança e, se você não confirmar em 15 s, desfaz sozinho. */
+              private fun confirmOrRevert(msg: String, revert: () -> Unit) {
+                  val h = Handler(Looper.getMainLooper())
+                  val holder = arrayOfNulls<AlertDialog>(1)
+                  var done = false
+                  val r = Runnable {
+                      if (!done) {
+                          done = true
+                          holder[0]?.dismiss()
+                          exec.execute { revert() }
+                      }
+                  }
+                  val d = AlertDialog.Builder(this)
+                      .setTitle("Manter a alteração?")
+                      .setMessage(msg + "\nSe você não responder, volta sozinho em 15 segundos.")
+                      .setCancelable(false)
+                      .setPositiveButton("Manter") { _, _ ->
+                          done = true
+                          h.removeCallbacks(r)
+                      }
+                      .setNegativeButton("Desfazer") { _, _ ->
+                          if (!done) {
+                              done = true
+                              h.removeCallbacks(r)
+                              exec.execute { revert() }
+                          }
+                      }
+                      .create()
+                  holder[0] = d
+                  d.show()
+                  h.postDelayed(r, 15000)
+              }
+
+              // ---------- fluxos ----------
+              private fun settingsEditor(ns: String) {
+                  exec.execute {
+                      val items = sec.listSettings(ns)
+                      runOnUiThread {
+                          browse("$ns (${items.size} chaves)", items) { line ->
+                              val key = line.substringBefore("=")
+                              val value = line.substringAfter("=")
+                              editValue("$ns/$key", value,
+                                  { v -> runTask { sec.setSetting(ns, key, v) } },
+                                  { runTask { sec.delSetting(ns, key) } })
+                          }
+                      }
+                  }
+              }
+
+              private fun newSetting() {
+                  val nss = listOf("global", "secure", "system")
+                  pickOne("Namespace", nss) { i ->
+                      input("Nome da chave", "ex.: minha_chave", "") { key ->
+                          input("Valor", "", "") { v -> runTask { sec.setSetting(nss[i], key.trim(), v) } }
+                      }
+                  }
+              }
+
+              private fun deviceConfigEditor() {
+                  exec.execute {
+                      val items = sec.listDeviceConfig()
+                      runOnUiThread {
+                          browse("device_config (${items.size} flags)", items) { line ->
+                              val t = sec.splitDc(line)
+                              editValue("${t.first}/${t.second}", t.third,
+                                  { v -> runTask { sec.setDc(t.first, t.second, v) } },
+                                  { runTask { sec.delDc(t.first, t.second) } })
+                          }
+                      }
+                  }
+              }
+
+              private fun propsBrowser() {
+                  exec.execute {
+                      val items = sec.listProps()
+                      runOnUiThread {
+                          browse("Propriedades (${items.size})", items) { line ->
+                              val key = line.substringBefore(" = ")
+                              val value = line.substringAfter(" = ", "")
+                              editValue(key, value, { v -> runTask { sec.setProp(key, v) } }, null)
+                          }
+                      }
+                  }
+              }
+
+              private fun pickApp(title: String, system: Boolean, onPick: (String) -> Unit) {
+                  exec.execute {
+                      val pk = sec.listPackages(system).map { it to label(it) }.sortedBy { it.second.lowercase() }
+                      runOnUiThread {
+                          browse(title, pk.map { it.second + "  (" + it.first + ")" }) { line ->
+                              onPick(line.substringAfterLast("(").removeSuffix(")"))
+                          }
+                      }
+                  }
+              }
+
+              private fun chooseMode(pkg: String, op: String) {
+                  val modes = listOf("allow", "ignore", "deny", "default", "foreground")
+                  pickOne("$op → modo", modes) { i -> runTask { sec.setOp(pkg, op, modes[i]) } }
+              }
+
+              private fun appOpsFlow(system: Boolean) {
+                  pickApp("Escolha o app", system) { pkg ->
+                      exec.execute {
+                          val ops = listOf("＋ Digitar nome da operação...") + sec.appOps(pkg)
+                          runOnUiThread {
+                              browse("App Ops: $pkg", ops) { line ->
+                                  if (line.startsWith("＋")) {
+                                      input("Nome da operação", "ex.: RUN_IN_BACKGROUND", "") { op ->
+                                          chooseMode(pkg, op.trim().uppercase())
+                                      }
+                                  } else {
+                                      chooseMode(pkg, line.substringBefore(":").trim())
+                                  }
+                              }
+                          }
+                      }
+                  }
+              }
+
+              private fun permsFlow(system: Boolean) {
+                  pickApp("Escolha o app", system) { pkg ->
+                      exec.execute {
+                          val ps = sec.appPerms(pkg)
+                          runOnUiThread {
+                              browse("Permissões: $pkg", ps) { line ->
+                                  val perm = line.substringBefore(":")
+                                  val granted = line.contains("CONCEDIDA")
+                                  pickOne(perm, listOf("Conceder", "Revogar")) { i ->
+                                      runTask { sec.setPerm(pkg, perm, i == 0, granted) }
+                                  }
+                              }
+                          }
+                      }
+                  }
+              }
+
+              private fun overlaysFlow() {
+                  exec.execute {
+                      val items = sec.listOverlays()
+                      runOnUiThread {
+                          browse("Overlays (${items.size})", items) { line ->
+                              val name = line.drop(5).trim()
+                              pickOne(name, listOf("Ativar", "Desativar")) { i ->
+                                  runTask { sec.setOverlay(name, i == 0) }
+                              }
+                          }
+                      }
+                  }
+              }
+
+              private fun hiddenFlow() {
+                  pickOne("Opções ocultas populares", sec.hidden.map { it.label }) { i ->
+                      val h = sec.hidden[i]
+                      AlertDialog.Builder(this)
+                          .setTitle(h.label)
+                          .setPositiveButton("Ligar") { _, _ -> runTask { sec.applyHidden(h, true) } }
+                          .setNegativeButton("Desligar") { _, _ -> runTask { sec.applyHidden(h, false) } }
+                          .setNeutralButton("Cancelar", null)
+                          .show()
+                  }
+              }
+
+              private fun launchFlow() {
+                  pickOne("Telas e atividades ocultas", sec.launches.map { it.label }) { i ->
+                      runTask { sec.launch(sec.launches[i]) }
+                  }
+              }
+
+              // ---------- ciclo de vida ----------
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  sec = Secrets(this) { msg -> say(msg) }
+
+                  root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+                  val pad = dp(16)
+                  root.setOnApplyWindowInsetsListener { v, ins ->
+                      val b = ins.getInsets(WindowInsets.Type.systemBars())
+                      v.setPadding(pad, b.top + pad, pad, b.bottom + pad)
+                      ins
+                  }
+
+                  root.addView(TextView(this).apply {
+                      text = "POCO SECRET SETTINGS"; textSize = 22f; setTypeface(null, Typeface.BOLD)
+                  })
+                  status = TextView(this).apply { setPadding(0, dp(8), 0, dp(8)) }
+                  root.addView(status)
+                  root.addView(TextView(this).apply {
+                      text = "Cuidado: mexer no que você não conhece pode travar apps. " +
+                          "Tudo que você alterar aqui fica guardado e volta ao original em 'DESFAZER TUDO'."
+                      textSize = 13f
+                  })
+
+                  root.addView(Button(this).apply {
+                      text = "Conceder permissão Shizuku"
+                      setAllCaps(false)
+                      setOnClickListener {
+                          if (!Shizuku.pingBinder()) toast("Abra o app Shizuku e inicie o serviço primeiro.")
+                          else Shizuku.requestPermission(100)
+                      }
+                  })
+
+                  logView = TextView(this).apply {
+                      setTextIsSelectable(true); typeface = Typeface.MONOSPACE; textSize = 12f
+                      setPadding(0, dp(12), 0, dp(4)); text = "Os resultados aparecem aqui.\n"
+                  }
+                  root.addView(logView)
+                  root.addView(Button(this).apply {
+                      text = "Copiar resultados"; setAllCaps(false)
+                      setOnClickListener {
+                          val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                          cm.setPrimaryClip(ClipData.newPlainText("log", logView.text))
+                          toast("Copiado")
+                      }
+                  })
+                  root.addView(Button(this).apply {
+                      text = "Limpar resultados"; setAllCaps(false)
+                      setOnClickListener { logView.text = "" }
+                  })
+
+                  section("🔎 EDITORES DE CONFIGURAÇÕES", true)
+                  addUi("Settings: system") { settingsEditor("system") }
+                  addUi("Settings: secure") { settingsEditor("secure") }
+                  addUi("Settings: global") { settingsEditor("global") }
+                  addUi("Criar/alterar uma chave manualmente") { newSetting() }
+                  addUi("device_config (flags internas do Android)") { deviceConfigEditor() }
+                  add("Impedir o servidor de reverter os flags (sync off)") { sec.dcSync(true) }
+                  add("Religar sync dos flags") { sec.dcSync(false) }
+
+                  section("🧬 PROPRIEDADES DO SISTEMA")
+                  addUi("Ver propriedades (getprop) e tentar alterar") { propsBrowser() }
+
+                  section("🔐 APP OPS E PERMISSÕES")
+                  addUi("App Ops: apps instalados") { appOpsFlow(false) }
+                  addUi("App Ops: apps do sistema") { appOpsFlow(true) }
+                  addUi("Permissões: apps instalados") { permsFlow(false) }
+                  addUi("Permissões: apps do sistema") { permsFlow(true) }
+
+                  section("🎨 OVERLAYS (temas e ajustes ocultos)")
+                  addUi("Listar e ativar/desativar overlays") { overlaysFlow() }
+
+                  section("📐 TELA: RESOLUÇÃO E DPI (volta sozinho se travar)")
+                  add("Ver resolução e DPI atuais") { sec.wmInfo() }
+                  addUi("Mudar DPI (densidade)") {
+                      input("Novo DPI", "3 dígitos, ex.: 420", "") { v ->
+                          exec.execute {
+                              sec.wmDensity(v.trim())
+                              runOnUiThread { confirmOrRevert("DPI alterado.") { sec.wmReset() } }
+                          }
+                      }
+                  }
+                  addUi("Mudar resolução") {
+                      input("Nova resolução", "ex.: 1080x2400", "") { v ->
+                          exec.execute {
+                              sec.wmSize(v.trim())
+                              runOnUiThread { confirmOrRevert("Resolução alterada.") { sec.wmReset() } }
+                          }
+                      }
+                  }
+                  add("Restaurar resolução e DPI") { sec.wmReset() }
+
+                  section("✨ OPÇÕES OCULTAS POPULARES")
+                  addUi("Escolher opção (ligar/desligar)") { hiddenFlow() }
+
+                  section("🚪 TELAS E CÓDIGOS OCULTOS")
+                  addUi("Abrir telas ocultas do Android/HyperOS") { launchFlow() }
+                  addUi("Economia de bateria por app (HyperOS)") {
+                      pickApp("Escolha o app", false) { pkg -> runTask { sec.powerKeeper(pkg, label(pkg)) } }
+                  }
+                  addUi("Códigos secretos (*#*#...#*#*)") {
+                      pickOne("Código secreto", sec.secretCodes.map { "*#*#$it#*#*" }) { i ->
+                          runTask { sec.secretCode(sec.secretCodes[i]) }
+                      }
+                  }
+
+                  section("💻 TERMINAL SHELL")
+                  addUi("Digitar um comando") {
+                      input("Comando shell", "ex.: dumpsys battery", "") { cmd ->
+                          if (cmd.isNotBlank()) runTask { sec.terminal(cmd.trim()) }
+                      }
+                  }
+                  addUi("Comandos prontos") {
+                      pickOne("Comandos prontos", presets) { i -> runTask { sec.terminal(presets[i]) } }
+                  }
+
+                  section("💾 DUMP, ALTERAÇÕES E BACKUP")
+                  add("Salvar dump completo em Download/poco_dump.txt") { sec.dumpAll() }
+                  add("Ver tudo que eu já alterei") { sec.showChanges() }
+                  addUi("♻️ DESFAZER TUDO (volta ao original)") {
+                      AlertDialog.Builder(this)
+                          .setTitle("Desfazer tudo?")
+                          .setMessage("Todos os valores alterados por este app voltam ao original.")
+                          .setPositiveButton("Desfazer") { _, _ -> runTask { sec.restoreAll() } }
+                          .setNegativeButton("Cancelar", null)
+                          .show()
+                  }
+
+                  setContentView(ScrollView(this).apply { addView(root) })
+
+                  Shizuku.addRequestPermissionResultListener(permListener)
+                  Shizuku.addBinderReceivedListenerSticky(binderListener)
+                  Shizuku.addBinderDeadListener(deadListener)
+                  refresh()
+              }
+
+              private fun refresh() {
+                  val ok = ready()
+                  status.text = when {
+                      !Shizuku.pingBinder() -> "● Shizuku não está rodando"
+                      !ok -> "● Shizuku ativo, falta permissão"
+                      else -> "● Pronto"
+                  }
+                  buttons.forEach { it.isEnabled = ok }
+              }
+
+              private fun runTask(action: () -> Unit) {
+                  buttons.forEach { it.isEnabled = false }
+                  exec.execute {
+                      try {
+                          action()
+                          say("✔ Concluído")
+                      } catch (e: Throwable) {
+                          say("Erro: ${e.message}")
+                      }
+                      runOnUiThread { refresh() }
+                  }
+              }
+
+              override fun onDestroy() {
+                  Shizuku.removeRequestPermissionResultListener(permListener)
+                  Shizuku.removeBinderReceivedListener(binderListener)
+                  Shizuku.removeBinderDeadListener(deadListener)
+                  super.onDestroy()
+              }
+          }
+          FIM7
+          gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PocoSecrets-apk
+          path: poco/app/build/outputs/apk/debug/app-debug.apk
